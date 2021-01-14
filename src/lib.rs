@@ -107,6 +107,144 @@ pub fn main_inner(xargo_mode: XargoMode) {
     }
 }
 
+pub fn scq_main_inner(xargo_mode: XargoMode, args: String) {
+    fn show_backtrace() -> bool {
+        env::var("RUST_BACKTRACE").as_ref().map(|s| &s[..]) == Ok("1")
+    }
+
+    match scq_run(xargo_mode, args) {
+        Err(e) => {
+            let stderr = io::stderr();
+            let mut stderr = stderr.lock();
+
+            writeln!(stderr, "error: {}", e).ok();
+
+            for e in e.iter().skip(1) {
+                writeln!(stderr, "caused by: {}", e).ok();
+            }
+
+            if show_backtrace() {
+                if let Some(backtrace) = e.backtrace() {
+                    writeln!(stderr, "{:?}", backtrace).ok();
+                }
+            } else {
+                writeln!(stderr, "note: run with `RUST_BACKTRACE=1` for a backtrace").ok();
+            }
+
+            process::exit(1)
+        }
+        Ok(Some(status)) => if !status.success() {
+            process::exit(status.code().unwrap_or(1))
+        },
+        Ok(None) => {}
+    }
+}
+
+fn scq_run(cargo_mode: XargoMode, args: String) -> Result<Option<ExitStatus>> {
+    let args = cli::to_args(args);
+    let verbose = args.verbose();
+
+    let meta = rustc::version().map_err(|_| "could not determine rustc version")?;
+
+    if let Some(sc) = args.subcommand() {
+        if !sc.needs_sysroot() {
+            return cargo::run(&args, verbose).map(Some);
+        }
+    } else if args.version() {
+        writeln!(
+            io::stderr(),
+            concat!("xargo ", env!("CARGO_PKG_VERSION"), "{}"),
+            include_str!(concat!(env!("OUT_DIR"), "/commit-info.txt"))
+        ).ok();
+
+        return cargo::run(&args, verbose).map(Some);
+    }
+
+    let cd = CurrentDirectory::get()?;
+
+    let config = cargo::config()?;
+    if let Some(root) = cargo::root(cargo_mode)? {
+        // We can't build sysroot with stable or beta due to unstable features
+        let sysroot = rustc::sysroot(verbose)?;
+        let src = match meta.channel {
+            Channel::Dev => rustc::Src::from_env().ok_or(
+                "The XARGO_RUST_SRC env variable must be set and point to the \
+                 Rust source directory when working with the 'dev' channel",
+            )?,
+            Channel::Nightly => if let Some(src) = rustc::Src::from_env() {
+                src
+            } else {
+                sysroot.src()?
+            },
+            Channel::Stable | Channel::Beta => {
+                eprintln!(
+                    "ERROR: the sysroot can't be built for the {:?} channel. \
+                     Switch to nightly.",
+                    meta.channel
+                );
+                process::exit(1);
+            }
+        };
+
+        let cmode = if let Some(triple) = args.target() {
+            if Path::new(triple).is_file() {
+                bail!(
+                    "Xargo doesn't support files as an argument to --target. \
+                     Use `--target foo` instead of `--target foo.json`."
+                )
+            } else if triple == meta.host {
+                Some(CompilationMode::Native(meta.host.clone()))
+            } else {
+                Target::new(triple, &cd, verbose)?.map(CompilationMode::Cross)
+            }
+        } else {
+            if let Some(ref config) = config {
+                if let Some(triple) = config.target()? {
+                    Target::new(triple, &cd, verbose)?.map(CompilationMode::Cross)
+                } else {
+                    Some(CompilationMode::Native(meta.host.clone()))
+                }
+            } else {
+                Some(CompilationMode::Native(meta.host.clone()))
+            }
+        };
+
+        if let Some(cmode) = cmode {
+            let home = xargo::home(&cmode)?;
+            let rustflags = cargo::rustflags(config.as_ref(), cmode.triple())?;
+
+            sysroot::update(
+                &cmode,
+                &home,
+                &root,
+                &rustflags,
+                &meta,
+                &src,
+                &sysroot,
+                verbose,
+                args.message_format(),
+                cargo_mode,
+            )?;
+
+            if args.subcommand().is_some() || cargo_mode == XargoMode::Build {
+                return xargo::run(
+                    &args,
+                    &cmode,
+                    rustflags,
+                    &home,
+                    &meta,
+                    config.as_ref(),
+                    verbose,
+                ).map(Some);
+            } else {
+                return Ok(None)
+            }
+        }
+    }
+
+    cargo::run(&args, verbose).map(Some)
+}
+
 fn run(cargo_mode: XargoMode) -> Result<Option<ExitStatus>> {
     let args = cli::args();
     let verbose = args.verbose();

@@ -69,3 +69,36 @@ pub fn args() -> Args {
         message_format: message_format
     }
 }
+
+pub fn to_args(args: String) -> Args {
+    let all = args.split_whitespace().map(|arg| arg.to_string()).collect::<Vec<_>>();
+
+    let mut sc = None;
+    let mut target = None;
+    let mut message_format = None;
+    {
+        let mut args = all.iter();
+        while let Some(arg) = args.next() {
+            if !arg.starts_with("-") {
+                sc = sc.or_else(|| Some(Subcommand::from(&**arg)));
+            }
+
+            if arg == "--target" {
+                target = args.next().map(|s| s.to_owned());
+            } else if arg.starts_with("--target=") {
+                target = arg.splitn(2, '=').nth(1).map(|s| s.to_owned());
+            } else if arg == "--message-format" {
+                message_format = args.next().map(|s| s.to_owned());
+            } else if arg.starts_with("--message-format=") {
+                message_format = arg.splitn(2, '=').nth(1).map(|s| s.to_owned());
+            }
+        }
+    }
+
+    Args {
+        all: all,
+        subcommand: sc,
+        target: target,
+        message_format: message_format
+    }
+}
